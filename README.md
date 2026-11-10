@@ -1,10 +1,14 @@
 # Movie Memory
 
-Sign in with Google, tell us your favorite movie, get a fun fact about it from an LLM (Claude, or OpenAI as an alternative).
+Sign in with Google, tell us your favorite movie, get a fun fact about it from Claude (OpenAI is supported as an alternative).
+
+**Live demo:** https://movie-memory.onrender.com (free Render instance; the first request after it has been idle can take ~50s to wake up).
 
 One Next.js app contains both the frontend (React Server Components + a few client components) and the backend (Route Handlers, a Server Action, Prisma/Postgres). There is nothing separate to run: `npm run dev` starts everything.
 
 **Variant chosen: A — Backend-Focused (caching + correctness).**
+
+> **Note on the LLM provider.** The brief lists the OpenAI API. The app ships with both an OpenAI and a Claude (Anthropic) generator behind the same `FactGenerator` interface, and uses Claude whenever `ANTHROPIC_API_KEY` is set. I ran it on Claude because my OpenAI account had no API credit (`429 insufficient_quota`). Set only `OPENAI_API_KEY` to run it on OpenAI. Caching, burst protection and failure handling are provider-agnostic and identical either way.
 
 ---
 
@@ -115,13 +119,13 @@ tests/                           Unit tests + Postgres integration tests
    RETURNING token
    ```
    No row → insert wins. Expired lease → update takes it over. Live lease → nothing returned. Postgres serialises concurrent upserts on the same key, so **exactly one** request wins.
-3. **Winner:** re-checks the cache *under the lease* (a peer may have finished and released between steps 1 and 2), calls OpenAI, stores the fact, returns `source: "generated"`, and releases the lease in `finally` (only if its token still matches).
-4. **Losers** (other tabs / rapid refreshes) do **not** call OpenAI. They poll the DB every 250ms for up to 8s for the winner's fact (`source: "cache"`). If it never appears they return the most recent older fact (`"fallback"`) or a friendly "still generating, try again" 503.
-5. **OpenAI failure** (10s timeout, `maxRetries: 0`, error, or empty reply): return the most recent cached fact for that movie (`"fallback"`), otherwise a friendly 503 with no internal details. The real error is only logged server-side.
+3. **Winner:** re-checks the cache *under the lease* (a peer may have finished and released between steps 1 and 2), calls Claude, stores the fact, returns `source: "generated"`, and releases the lease in `finally` (only if its token still matches).
+4. **Losers** (other tabs / rapid refreshes) do **not** call Claude. They poll the DB every 250ms for up to 8s for the winner's fact (`source: "cache"`). If it never appears they return the most recent older fact (`"fallback"`) or a friendly "still generating, try again" 503.
+5. **LLM failure** (timeout, `maxRetries: 0`, API error, safety refusal, or empty reply): return the most recent cached fact for that movie (`"fallback"`), otherwise a friendly 503 with no internal details. The real error is only logged server-side.
 
-The lease lasts 30s, longer than the worst-case OpenAI call (10s), so a live call never loses its lease; and because it expires on its own, a crashed request can't block a user forever.
+The lease lasts 30s, longer than the worst-case LLM call (20s timeout for Claude, 10s for OpenAI), so a live call never loses its lease; and because it expires on its own, a crashed request can't block a user forever.
 
-The UI shows which case happened ("Fresh fact", "Cached", "Couldn't reach OpenAI — showing your last fact") and counts down to when a new fact can be generated, using `freshUntil` from the API.
+The UI shows which case happened ("Fresh fact", "Cached", "Couldn't reach the AI service — showing your last fact") and counts down to when a new fact can be generated, using `freshUntil` from the API.
 
 ### Security
 - User identity only ever comes from the server-side session; no endpoint accepts a user id. Every query is scoped by that id.
@@ -133,10 +137,10 @@ The UI shows which case happened ("Fresh fact", "Cached", "Couldn't reach OpenAI
 ## 5. Tests
 
 `npm test` runs:
-- **`tests/fact-cache.test.ts`** — 60s window (59.999s → cache, exactly 60s → regenerate), facts for a previous movie are not reused, OpenAI failure → stale fallback / friendly error, lease released on failure, 5 concurrent requests → 1 OpenAI call, waiter timeout never calls OpenAI, expired lease is recoverable. Uses an injected fake clock, so no real waiting.
+- **`tests/fact-cache.test.ts`** — 60s window (59.999s → cache, exactly 60s → regenerate), facts for a previous movie are not reused, LLM failure → stale fallback / friendly error, lease released on failure, 5 concurrent requests → 1 LLM call, waiter timeout never calls the LLM, expired lease is recoverable. Uses an injected fake clock, so no real waiting.
 - **`tests/authorization.test.ts`** — a user never receives another user's fact (even for the same movie); a user with no movie can't fall through to someone else's facts; `GET /api/fact` returns 401 when signed out and only ever queries the session user; internal ids aren't exposed.
 - **`tests/movie-validation.test.ts`** — trimming, empty/whitespace/non-string, max length, control characters.
-- **`tests/integration/prisma-repository.test.ts`** — runs against real Postgres when `TEST_DATABASE_URL` is set (skipped otherwise): 20 concurrent lock attempts → exactly 1 winner, lease expiry/takeover/release by token, per-user locks, scoped latest-fact query, and an end-to-end burst of 10 requests → 1 OpenAI call and 1 stored fact.
+- **`tests/integration/prisma-repository.test.ts`** — runs against real Postgres when `TEST_DATABASE_URL` is set (skipped otherwise): 20 concurrent lock attempts → exactly 1 winner, lease expiry/takeover/release by token, per-user locks, scoped latest-fact query, and an end-to-end burst of 10 requests → 1 LLM call and 1 stored fact.
   ```bash
   TEST_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/movie_memory" npm test
   ```
@@ -144,27 +148,29 @@ The UI shows which case happened ("Fresh fact", "Cached", "Couldn't reach OpenAI
 ---
 
 ## 6. Why Variant A
-The interesting correctness problems in this app are on the server: a cache window that must be exact, concurrent requests that must not multiply paid OpenAI calls, and a third-party dependency that will sometimes fail. Those are also the parts where a bug costs money or leaks data, so they're where I wanted to spend the time and the tests.
+The interesting correctness problems in this app are on the server: a cache window that must be exact, concurrent requests that must not multiply paid LLM calls, and a third-party dependency that will sometimes fail. Those are also the parts where a bug costs money or leaks data, so they're where I wanted to spend the time and the tests.
 
 ## 7. Key tradeoffs
-- **Lease row vs. holding a DB transaction/advisory lock during the OpenAI call.** A transaction lock would tie up a pooled connection for up to 10s per generation. The lease row is held for milliseconds, survives across instances (unlike an in-memory lock), and self-heals via expiry. Cost: losers poll instead of being notified.
-- **Losers wait-and-poll instead of failing fast.** Gives every tab the same new fact at the cost of up to 8s of waiting; on timeout they degrade to the older fact rather than making a second OpenAI call.
+- **Lease row vs. holding a DB transaction/advisory lock during the LLM call.** A transaction lock would tie up a pooled connection for up to 20s per generation. The lease row is held for milliseconds, survives across instances (unlike an in-memory lock), and self-heals via expiry. Cost: losers poll instead of being notified.
+- **Losers wait-and-poll instead of failing fast.** Gives every tab the same new fact at the cost of up to 8s of waiting; on timeout they degrade to the older fact rather than making a second LLM call.
 - **App clock for timestamps.** `createdAt` and lease times are written from the app's clock so the service is fully testable with a fake clock. With several app instances, small clock skew could shift the window by that skew; acceptable here, and the DB clock (`now()`) would be the fix.
 - **Lock is per user, not per (user, movie).** A user has one movie at a time, so this is simpler and equivalent.
 - **Fallback only uses facts for the current movie.** Showing a fact about a previous movie would be wrong, so it shows an error instead.
-- **No automatic OpenAI retries.** Keeps worst-case latency at ~10s and within the lease; the cached fallback covers transient errors.
+- **No automatic LLM retries.** Keeps worst-case latency bounded (20s) and within the lease; the cached fallback covers transient errors.
+- **Claude instead of OpenAI (provider behind an interface).** See the note at the top. Swapping providers only touched `claude-generator.ts` and the wiring in `facts/index.ts`; the service and its tests didn't change. Claude runs at low effort, since a one-sentence fact needs little reasoning, which keeps latency and cost down.
 - **Database sessions over JWT.** Real logout (row deleted) and no user data in the cookie, at the cost of one DB read per request.
 
 ## 8. With 2 more hours
-- Rate limit `/api/fact` per user (the cache bounds OpenAI cost, but not request volume).
+- Rate limit `/api/fact` per user (the cache bounds LLM cost, but not request volume).
 - Use the DB clock (`now()`) for cache/lease decisions to remove multi-instance clock skew.
 - Let losers wait on Postgres `LISTEN/NOTIFY` instead of polling.
 - Playwright E2E test for the full Google → onboarding → dashboard flow with a mocked provider.
-- Structured logging + metrics for cache hit rate, OpenAI latency and failures.
+- Structured logging + metrics for cache hit rate, LLM latency and failures.
 - A daily cleanup job for old facts if history grows large.
 
 ## 9. AI usage
 - Used an AI assistant (Claude) to scaffold the project structure, Prisma schema, NextAuth wiring and Tailwind UI.
 - Used it to talk through concurrency options (transaction lock vs. lease row vs. unique-per-window constraint) before picking the lease row.
 - Used it to draft the tests and this README.
-- I reviewed every file, ran the tests against a real Postgres, and verified the flows (onboarding, cache, concurrent requests, OpenAI failure fallback, logout) by running the app.
+- Used it to debug setup and deployment (Google OAuth callback errors, Neon Postgres, Render environment variables) and to add the Claude generator when my OpenAI account had no API credit.
+- I reviewed every file, ran the tests against a real Postgres, and verified the flows (onboarding, cache, concurrent requests, LLM failure fallback, logout) by running the app locally and on Render.
